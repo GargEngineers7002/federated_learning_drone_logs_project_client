@@ -1,34 +1,28 @@
-# Federated Learning Drone Trajectory Prediction
+# Drone Trajectory Prediction - Client Node (Frontend & Local Inference)
 
-A centralized federated learning system for predicting drone trajectories based on flight logs. This project uses **FastAPI** for the central hub and **Flower (flwr)** for the federated learning orchestration.
+The client node for the drone trajectory prediction federated learning system. 
 
 ## Architecture Overview
 
-The system is designed with a **Hub-and-Spoke** architecture where nodes perform both inference and training:
-
-*   **Central Hub (Server):** 
-    *   Hosts the web interface for end users.
-    *   Manages a job queue for trajectory prediction.
-    *   Runs the Flower Federated Learning server to aggregate model weights.
+This is the **Worker Node (Client)** of the federated learning system:
 *   **Worker Node (Client):** 
-    *   Polls the Hub for new prediction jobs.
-    *   Performs local inference using pre-trained models.
-    *   Returns results to the Hub for user visualization.
-    *   Participates in Federated Learning rounds to improve the global model without sharing raw data.
+    *   Hosts the web interface (HTML/JS/CSS) for end users.
+    *   Accepts drone flight logs (CSV).
+    *   Retrieves the latest global model from the Central Hub.
+    *   Trains the local model on the newly uploaded flight log.
+    *   Performs local inference and returns the predicted trajectory.
+    *   Sends updated model weights back to the Central Hub for aggregation in the background.
 
 ## Project Structure
 
 ```text
 website_work/
 ├── app/
-│   ├── main.py                 # Central Hub API & Web Server
-│   ├── ml_models.py            # Model loading and inference logic
-│   ├── federated_learning/
-│   │   ├── fl_server.py        # Flower FL Server implementation
-│   │   ├── fl_client.py        # Worker Node polling & training logic
-│   │   └── utils.py            # FL helper functions (model creation, etc.)
+│   ├── main.py                 # Client API & Web Server
+│   ├── ml_models.py            # Model inference logic
+│   ├── fl.py                   # Local training & FL synchronization logic
 │   └── template/               # Frontend (HTML/JS/CSS)
-└── models/                     # Pre-trained .keras models and scalers
+└── models/                     # Local .keras models and scalers
 ```
 
 ## Setup & Installation
@@ -38,32 +32,23 @@ website_work/
     pip install -r requirements.txt
     ```
 
-2.  **Export PYTHONPATH:**
-    Crucial for resolving module imports across the project. Run this from the project root:
-    ```bash
-    export PYTHONPATH=$PYTHONPATH:.
+2.  **Configure Backend Connection:**
+    Ensure you have a `.env` file specifying the Central Hub's URL:
+    ```
+    BACKEND_SERVER_URL=http://localhost:8000
     ```
 
-3.  **Start the Central Hub:**
-    The hub starts both the Web API (port 8000) and the FL Server (port 8080).
+3.  **Start the Client Server:**
+    The client starts the Web API and UI on port 8001.
     ```bash
+    export PYTHONPATH=$PYTHONPATH:.
     python website_work/app/main.py
     ```
 
-4.  **Start a Worker Node:**
-    Run this on the machine(s) equipped with the models and training data.
-    ```bash
-    python website_work/app/federated_learning/fl_client.py --website_url http://localhost:8000 --fl_server localhost:8080
-    ```
-
-## Notes on Hardware & Errors
-*   **GPU Warnings:** You may see `Could not find cuda drivers`. This is expected and the system will gracefully fallback to **CPU Mode**.
-*   **Flower Warnings:** The Flower server may show deprecation warnings regarding `start_server`. These can be ignored for this implementation.
-
 ## Usage Workflow
 
-1.  **User Upload:** An end user uploads a drone flight log (CSV) via the web interface.
-2.  **Task Queuing:** The Hub receives the file, creates a job, and adds it to the queue.
-3.  **Node Processing:** A Worker Node pulls the job, runs the prediction, and sends the trajectory back.
-4.  **Result Display:** The Hub marks the job as complete, and the web interface displays the 2D/3D trajectory and performance metrics.
-5.  **Federated Learning:** In the background, the Node and Hub engage in an FL training round using the uploaded data to refine the global model.
+1.  **User Upload:** An end user uploads a drone flight log (CSV) via the web interface (`localhost:8001`).
+2.  **Global Sync:** The client fetches the latest global model weights from the Central Hub (`localhost:8000`) and updates its local model.
+3.  **Local Training:** The client briefly trains the model on the new data sequence.
+4.  **Inference:** The client predicts the trajectory using the locally updated model and displays it to the user.
+5.  **Federated Learning:** In the background, the client sends its updated weights back to the Central Hub for aggregation.
