@@ -1,42 +1,30 @@
-import uuid
-import asyncio
 import os
-import multiprocessing
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+import uuid
+import httpx
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
-from typing import Annotated, Dict, List
-from contextlib import asynccontextmanager
-
-# Import FL server components
+from typing import Annotated
+from dotenv import load_dotenv
 from website_work.app.fl import (
     process_job,
-    get_global_model,
-    get_processed_data,
-    federated_average,
+    train_and_save_model,
+    save_global_model_weights,
 )
 
-# Suppress TensorFlow GPU warnings if CPU-only is expected
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+# Load environment variables from .env file
+load_dotenv()
+
+app = FastAPI(title="UAV Trajectory Prediction Client Server")
+
+# Get backend URL from .env, default to localhost:8000
+BACKEND_SERVER_URL = os.getenv("BACKEND_SERVER_URL", "http://localhost:8000")
 
 
-app = FastAPI(title="UAV Trajectory Prediction Central Hub")
-
-
-# -----------------------
-# TEST ROUTE
-# -----------------------
-@app.get("/test")
-async def test():
-    print("DEBUG: /test endpoint pinged.")
-    return {"status": "Central Hub is running"}
-
-
-# -----------------------
-# POST /api/predict_trajectory
-# -----------------------
 @app.post("/api/predict_trajectory")
 async def predict_trajectory(
-    uav_model: Annotated[str, Form()], flight_log: Annotated[UploadFile, File()]
+    uav_model: Annotated[str, Form()], 
+    flight_log: Annotated[UploadFile, File()],
+    background_tasks: BackgroundTasks
 ):
     print(f"\n[USER] New prediction request received for model: {uav_model}")
     if not flight_log.filename or not flight_log.filename.lower().endswith(".csv"):
@@ -50,9 +38,31 @@ async def predict_trajectory(
 
         job_id = str(uuid.uuid4())  # Generate a unique job ID
 
-        results = await process_job(job_id, uav_model, csv_str)  # Run prediction
+        # get the global model from the backend and save the model to the disk
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{BACKEND_SERVER_URL}/api/get_global",
+                params={"uav_model": uav_model},
+                timeout=60.0,
+            )
+            if resp.status_code == 200:
+                global_data = resp.json()
+                await save_global_model_weights(uav_model, global_data["weights"])
+            else:
+                print(f"[CLIENT] Failed to fetch global model: {resp.text}")
+        # Train and save BEFORE prediction
+        new_weights = await train_and_save_model(uav_model, csv_str)
+
+        # Run prediction on the newly updated model
+        results = await process_job(job_id, uav_model, csv_str)
 
         print(f"[HUB] Returning results for Job {job_id} to user.")
+        
+        # Send the federated averaging update to the background AFTER returning
+        if new_weights is not None:
+            from website_work.app.fl import send_weights_to_backend
+            background_tasks.add_task(send_weights_to_backend, uav_model, new_weights)
+
         return {
             "uav_model": uav_model,
             "results": results,
@@ -64,44 +74,7 @@ async def predict_trajectory(
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
 
 
-@app.post("/api/get_global")
-async def get_global(uav_model: Annotated[str, Form()]):
-    try:
-        global_model_weights = await get_global_model(uav_model)
-        return global_model_weights
-    except Exception as e:
-        print(f"[HUB] ERROR in get_global: {e}")
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
-
-
-@app.post("/api/get_processed")
-async def get_processed(
-    uav_model: Annotated[str, Form()], flight_log: Annotated[UploadFile, File()]
-):
-    try:
-        processed_data = await get_processed_data(uav_model, flight_log)
-        return processed_data
-    except Exception as e:
-        print(f"[HUB] ERROR in get_processed: {e}")
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
-
-
-@app.post("/api/federated_averaging")
-async def federated_averaging(
-    uav_model: Annotated[str, Form()],
-    weights: Annotated[str, Form()],
-):
-    try:
-        await federated_average(uav_model, weights)
-        return {"status": "Federated averaging completed."}
-    except Exception as e:
-        print(f"[HUB] ERROR in federated_averaging: {e}")
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
-
-
-# -----------------------
-# STATIC FILES (FRONTEND)
-# -----------------------
+# Mount static files (Frontend HTML/JS/CSS)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app.mount(
     "/",
@@ -112,5 +85,6 @@ app.mount(
 if __name__ == "__main__":
     import uvicorn
 
-    print("\n🔍 Launching Uvicorn server on http://localhost:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("\n🔍 Launching Client Uvicorn server ")
+    print(f"🔗 Connected to Backend at: {BACKEND_SERVER_URL}")
+    uvicorn.run(app, host="0.0.0.0", port=8001)

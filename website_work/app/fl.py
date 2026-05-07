@@ -94,34 +94,6 @@ DRONE_CONFIG = {
 }
 
 
-async def get_global_model(uav_model_name):
-    config = DRONE_CONFIG.get(uav_model_name)
-    if config is None:
-        raise ValueError(
-            f"Unknown UAV model: '{uav_model_name}'. "
-            f"Valid options: {list(DRONE_CONFIG.keys())}"
-        )
-
-    folder = config["folder"]
-    drone_models_dir = os.path.join(MODELS_DIR, folder)
-    model_path = os.path.join(drone_models_dir, MODEL_FILENAME)
-
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    global_model = await asyncio.to_thread(load_model, model_path)
-    global_model = cast(Model, global_model)
-    assert global_model is not None
-
-    # Convert weights to list for JSON serialization
-    weights = [w.tolist() for w in global_model.get_weights()]
-
-    # Also return model architecture
-    model_config = global_model.get_config()
-
-    return {"weights": weights, "config": model_config}
-
-
 async def get_processed_data(uav_model, flight_log):
     # Read CSV
     contents = await flight_log.read()
@@ -178,70 +150,115 @@ async def get_processed_data(uav_model, flight_log):
     return {"x": np.array(X_sequences).tolist(), "y": np.array(y_targets).tolist()}
 
 
-client_updates_dict = {}
-MODEL_LIMIT = 1  # Threshold for aggregation
-updates_lock = asyncio.Lock()
-
-
-async def federated_average(uav_model, weights_json):
-    global client_updates_dict
-
-    # Validate UAV model early
-    config = DRONE_CONFIG.get(uav_model)
+async def save_global_model_weights(uav_model_name, weights_list):
+    config = DRONE_CONFIG.get(uav_model_name)
     if config is None:
-        raise ValueError(f"Unknown UAV model: {uav_model}")
+        return
+    folder = config["folder"]
+    model_path = os.path.join(MODELS_DIR, folder, MODEL_FILENAME)
 
-    # Parse weights
-    weights = json.loads(weights_json)
+    def _sync_save():
+        if os.path.exists(model_path):
+            model = load_model(model_path)
+            weights = [np.array(w) for w in weights_list]
+            model.set_weights(weights)
+            model.save(model_path)
 
-    avg_weights = None
-    async with updates_lock:
-        if uav_model not in client_updates_dict:
-            client_updates_dict[uav_model] = []
+    await asyncio.to_thread(_sync_save)
 
-        client_updates_dict[uav_model].append(weights)
 
-        if len(client_updates_dict[uav_model]) >= MODEL_LIMIT:
-            all_updates = client_updates_dict[uav_model]
-            num_layers = len(all_updates[0])
+async def train_and_save_model(uav_model_name, csv_str):
+    # Load and Train the model and save it to the disk so that when retrieved while inference, it can be used
+    def _sync_train():
+        df = pd.read_csv(io.StringIO(csv_str))
+        preprocessed_data = preprocess_data(df.copy(), uav_model_name)
+        resources = _load_drone_resources(uav_model_name)
 
-            avg_weights = []
-            for i in range(num_layers):
-                layer_updates = [np.array(client[i]) for client in all_updates]
-                avg_weights.append(np.mean(layer_updates, axis=0))
+        input_scaler = resources["input_scaler"]
+        target_scaler = resources["target_scaler"]
+        target_cols = resources["target_cols"]
 
-            # Clear queue
-            client_updates_dict[uav_model] = []
+        X_features = preprocessed_data.drop(
+            columns=target_cols, errors="ignore"
+        ).fillna(0)
+        X_scaled = (
+            input_scaler.transform(X_features) if input_scaler else X_features.values
+        )
+        X_scaled = np.nan_to_num(X_scaled, nan=0.0)
 
-    if avg_weights is not None:
-        # Perform model update and save outside the lock
+        for col in target_cols:
+            if col not in df.columns:
+                df[col] = 0.0
+
+        ground_truth_raw = df[target_cols].fillna(0).values
+        ground_truth_scaled = (
+            target_scaler.transform(ground_truth_raw)
+            if target_scaler
+            else ground_truth_raw
+        )
+        ground_truth_scaled = np.nan_to_num(np.asarray(ground_truth_scaled), nan=0.0)
+
+        if len(X_scaled) < SEQ_LENGTH + 1:
+            print("Insufficient data for training. Skipping.")
+            return None
+
+        X_sequences = []
+        y_targets = []
+        for i in range(len(X_scaled) - SEQ_LENGTH):
+            X_sequences.append(X_scaled[i : i + SEQ_LENGTH])
+            y_targets.append(ground_truth_scaled[i + SEQ_LENGTH])
+
+        X_train = np.array(X_sequences)
+        y_train = np.array(y_targets)
+
+        config = DRONE_CONFIG.get(uav_model_name)
+        if config is None:
+            return None
         folder = config["folder"]
-        drone_models_dir = os.path.join(MODELS_DIR, folder)
-        model_path = os.path.join(drone_models_dir, MODEL_FILENAME)
+        model_path = os.path.join(MODELS_DIR, folder, MODEL_FILENAME)
 
-        def _sync_update_and_save():
-            global_model = load_model(model_path)
-            global_model = cast(Model, global_model)
-            current_weights = global_model.get_weights()
+        if not os.path.exists(model_path):
+            print(f"Model path {model_path} does not exist. Skipping training.")
+            return None
 
-            # Validation: ensure shapes match
-            if len(avg_weights) != len(current_weights):
-                raise ValueError(
-                    f"Weight layer count mismatch. Expected {len(current_weights)}, got {len(avg_weights)}"
-                )
+        from typing import Any
 
-            for i, (aw, cw) in enumerate(zip(avg_weights, current_weights)):
-                if aw.shape != cw.shape:
-                    raise ValueError(
-                        f"Weight shape mismatch at layer {i}. Expected {cw.shape}, got {aw.shape}"
-                    )
+        model: Any = load_model(model_path)
 
-            global_model.set_weights(avg_weights)
+        if model is None:
+            print(f"Failed to load the model from {model_path}")
+            return None
 
-            # Atomic save: write to temp, then rename
-            temp_path = model_path + ".tmp"
-            global_model.save(temp_path)
-            os.replace(temp_path, model_path)
+        # Train
+        model.fit(X_train, y_train, epochs=1, batch_size=32, verbose=0)
 
-        await asyncio.to_thread(_sync_update_and_save)
-        print(f"Federated Averaging completed for {uav_model}. Global model updated.")
+        # Save back to disk
+        model.save(model_path)
+
+        # Return new weights
+        return [w.tolist() for w in model.get_weights()]
+
+    new_weights = await asyncio.to_thread(_sync_train)
+    return new_weights
+
+
+async def send_weights_to_backend(uav_model_name, new_weights):
+    import httpx
+    from dotenv import load_dotenv
+    import json
+
+    load_dotenv()
+    backend_url = os.getenv("BACKEND_SERVER_URL", "http://localhost:8000")
+
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(
+                f"{backend_url}/api/federated_averaging",
+                data={"uav_model": uav_model_name, "weights": json.dumps(new_weights)},
+                timeout=60.0,
+            )
+            print(
+                f"[CLIENT] Successfully sent updated weights for {uav_model_name} to backend."
+            )
+        except Exception as e:
+            print(f"[CLIENT] Failed to send federated averaging update: {e}")
