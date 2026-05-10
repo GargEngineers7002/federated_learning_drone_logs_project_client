@@ -229,6 +229,17 @@ async def train_and_save_model(uav_model_name, csv_str):
             print(f"Failed to load the model from {model_path}")
             return None
 
+        # --- Dynamic Feature Alignment ---
+        expected_dim = model.input_shape[-1]
+        current_dim = X_train.shape[-1]
+        if current_dim > expected_dim:
+            print(f"[INFO] Training: Slicing features from {current_dim} to {expected_dim}")
+            X_train = X_train[:, :, -expected_dim:]
+        elif current_dim < expected_dim:
+            print(f"[INFO] Training: Padding features from {current_dim} to {expected_dim}")
+            padding = np.zeros((X_train.shape[0], X_train.shape[1], expected_dim - current_dim))
+            X_train = np.concatenate([X_train, padding], axis=-1)
+
         # Train
         model.fit(X_train, y_train, epochs=1, batch_size=32, verbose=0)
 
